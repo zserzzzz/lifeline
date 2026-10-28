@@ -1,17 +1,20 @@
 package com.ainn.client;
 
 import com.google.gson.*;
+import com.mojang.brigadier.arguments.FloatArgumentType;
+import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.*;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
-import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
-import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.phys.Vec3;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -22,15 +25,19 @@ import java.util.concurrent.*;
 public class LifeLineMod implements ClientModInitializer {
 	// ---- CONFIG ----
 	static final String WS_URL = "wss://sos-hub.ainnwss.workers.dev/?key=1355";
-	static final float TRIGGER_HP = 2.0f;          // fires at 2 HP (1 heart) or lower
+
+	// Configurable Settings (modifiable via /sos commands)
+	static boolean enabled = true;                          // Master toggle for all SOS features
+	static float triggerHp = 2.0f;                          // Health amount to trigger
+	static String customMessage = "§c§lHELP! §e{name} is down at {coords}!";
+	static long sosLifetimeMs = 15_000;                     // How long the SOS stays on HUD (in milliseconds)
+
 	static final long COOLDOWN_MS = 30_000;
-	static final long SOS_LIFETIME_MS = 120_000;
-	static final boolean FORCE_BEAM = false;       // true = always show beam (for testing)
 	// -----------------
 
 	static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger("LifelineMod");
 
-	record Sos(String name, int x, int y, int z, boolean beam, long expires) {}
+	record Sos(String name, int x, int y, int z, String message, long expires) {}
 
 	static final List<Sos> active = new CopyOnWriteArrayList<>();
 	static volatile WebSocket socket;
@@ -55,100 +62,113 @@ public class LifeLineMod implements ClientModInitializer {
 			}
 		}, 30, 30, TimeUnit.SECONDS);
 
-		// low-health trigger + cleanup
+		// Register client-side commands
+		ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+			dispatcher.register(
+					literal("sos")
+							.then(literal("toggle")
+									.executes(context -> {
+										enabled = !enabled;
+										String status = enabled ? "§aENABLED" : "§cDISABLED";
+										context.getSource().sendFeedback(Component.literal("§7[LifeLine] SOS Mod is now " + status));
+										return 1;
+									})
+							)
+							.then(literal("config")
+									.then(literal("message")
+											.then(argument("text", StringArgumentType.greedyString())
+													.executes(context -> {
+														customMessage = StringArgumentType.getString(context, "text");
+														context.getSource().sendFeedback(Component.literal("§a[LifeLine] Custom message updated to: §f" + customMessage));
+														return 1;
+													})
+											)
+									)
+									.then(literal("health")
+											.then(argument("hp", FloatArgumentType.floatArg(0.0f, 20.0f))
+													.executes(context -> {
+														triggerHp = FloatArgumentType.getFloat(context, "hp");
+														context.getSource().sendFeedback(Component.literal("§a[LifeLine] Trigger HP updated to: §f" + triggerHp));
+														return 1;
+													})
+											)
+									)
+									.then(literal("duration")
+											.then(argument("seconds", IntegerArgumentType.integer(1, 300))
+													.executes(context -> {
+														int secs = IntegerArgumentType.getInteger(context, "seconds");
+														sosLifetimeMs = secs * 1_000L;
+														context.getSource().sendFeedback(Component.literal("§a[LifeLine] HUD duration updated to: §f" + secs + " seconds"));
+														return 1;
+													})
+											)
+									)
+							)
+			);
+		});
+
+		// Low-health trigger + cleanup
 		ClientTickEvents.END_CLIENT_TICK.register(mc -> {
-			if (mc.player == null) return;
-			boolean low = mc.player.getHealth() <= TRIGGER_HP && mc.player.isAlive();
+			if (!enabled || mc.player == null) return;
+			boolean low = mc.player.getHealth() <= triggerHp && mc.player.isAlive();
 			if (low && !wasLow && System.currentTimeMillis() - lastSent > COOLDOWN_MS) sendSos(mc);
 			wasLow = low;
 			active.removeIf(s -> s.expires < System.currentTimeMillis());
 		});
 
-		// HUD: SOS list + beam overlays
+		// HUD: Compact list overlay
 		HudElementRegistry.attachElementAfter(
 				VanillaHudElements.CHAT,
 				Identifier.fromNamespaceAndPath("lifelinemod", "sos_hud"),
 				(graphics, tickCounter) -> {
+					if (!enabled) return;
 					Minecraft mc = Minecraft.getInstance();
 					if (mc.player == null) return;
 					int y = 4;
 					for (Sos s : active) {
+						String displayMsg = s.message != null && !s.message.isEmpty() ? " - " + s.message : "";
 						graphics.drawString(mc.font,
-								"§c[SOS] §f" + s.name + " §7@ " + s.x + " " + s.y + " " + s.z,
+								"§c[SOS] §f" + s.name + displayMsg + " §7@ " + s.x + " " + s.y + " " + s.z,
 								4, y, 0xFFFFFFFF);
 						y += 10;
-						if (s.beam) drawBeamOverlay(graphics, mc, s);
 					}
 				});
 	}
 
-	// ---------- beam: projected onto the screen as a tall red pillar ----------
-	static void drawBeamOverlay(GuiGraphics g, Minecraft mc, Sos s) {
-		Vec3 eye = mc.player.getEyePosition();
-		double dx = s.x + 0.5 - eye.x, dy = s.y + 0.5 - eye.y, dz = s.z + 0.5 - eye.z;
-
-		double yaw = Math.toRadians(mc.player.getYRot());
-		double pitch = Math.toRadians(mc.player.getXRot());
-		double fx = -Math.sin(yaw) * Math.cos(pitch);
-		double fy = -Math.sin(pitch);
-		double fz = Math.cos(yaw) * Math.cos(pitch);
-		double rx = -Math.cos(yaw), rz = -Math.sin(yaw);
-
-		double depth = dx * fx + dy * fy + dz * fz;
-		double right = dx * rx + dz * rz;
-		if (depth < 0.5) return; // behind you
-
-		int W = mc.getWindow().getGuiScaledWidth();
-		int H = mc.getWindow().getGuiScaledHeight();
-		double tanHalf = Math.tan(Math.toRadians(mc.options.fov().get()) / 2.0);
-		double aspect = (double) W / H;
-
-		double ndcX = (right / depth) / (tanHalf * aspect);
-		if (Math.abs(ndcX) > 1.3) return; // off screen
-		int sx = (int) (W / 2.0 * (1 + ndcX));
-		int w = (int) Math.max(2, Math.min(40, 0.5 * (W / 2.0) / (depth * tanHalf * aspect)));
-
-		g.fill(sx - w / 2, 0, sx + w / 2, H, 0x55FF2020);   // glow
-		g.fill(sx - 1, 0, sx + 1, H, 0xCCFF5555);           // core
-
-		int dist = (int) Math.sqrt(dx * dx + dy * dy + dz * dz);
-		String label = "§cSOS §f" + s.name + " §7" + dist + "m";
-		g.drawString(mc.font, label, sx - mc.font.width(label) / 2, 28, 0xFFFFFFFF);
-	}
-
-	// ---------- title on screen ----------
-	static void showTitle(Minecraft mc, String name, int x, int y, int z) {
-		mc.gui.setTimes(10, 70, 20);
-		mc.gui.setSubtitle(Component.literal("§7" + x + " " + y + " " + z));
+	static void showTitle(Minecraft mc, String name, int x, int y, int z, String message) {
+		// Shorter fade-in, stay, and fade-out times so title clears quickly
+		mc.gui.setTimes(5, 30, 10);
+		mc.gui.setSubtitle(Component.literal("§e" + message));
 		mc.gui.setTitle(Component.literal("§cSOS (" + name + ")"));
 	}
 
-	// ---------- waypoint mod detection ----------
-	static boolean hasXaero() {
-		return FabricLoader.getInstance().isModLoaded("xaerominimap");
-	}
-
-	static boolean hasWaypointMod() {
-		FabricLoader l = FabricLoader.getInstance();
-		return l.isModLoaded("xaerominimap") || l.isModLoaded("wwaypoints");
-	}
-
-	// ---------- sending ----------
 	static void sendSos(Minecraft mc) {
+		if (!enabled) return;
 		String ip = currentServer(mc);
-		if (ip == null) { LOG.warn("SOS not sent: no server address (singleplayer/LAN?)"); return; }
+		if (ip == null) { LOG.warn("SOS not sent: no server address"); return; }
 		if (socket == null) { LOG.warn("SOS not sent: websocket not connected"); return; }
+
+		String playerName = mc.player.getGameProfile().name();
+		String coordsStr = mc.player.getBlockX() + ", " + mc.player.getBlockY() + ", " + mc.player.getBlockZ();
+
+		// Replace variables {name} and {coords} in the custom message
+		String processedMessage = customMessage
+				.replace("{name}", playerName)
+				.replace("{coords}", coordsStr);
+
 		JsonObject o = new JsonObject();
-		o.addProperty("name", mc.player.getGameProfile().name());
+		o.addProperty("name", playerName);
 		o.addProperty("coords", mc.player.getBlockX() + "," + mc.player.getBlockY() + "," + mc.player.getBlockZ());
 		o.addProperty("ip", ip);
+		o.addProperty("message", processedMessage);
+
 		socket.sendText(o.toString(), true);
 		lastSent = System.currentTimeMillis();
 		LOG.info("SOS sent: {}", o);
 	}
 
-	// ---------- receiving ----------
 	static void onPacket(String json) {
+		if (!enabled) return;
 		Minecraft mc = Minecraft.getInstance();
 		mc.execute(() -> {
 			try {
@@ -156,37 +176,43 @@ public class LifeLineMod implements ClientModInitializer {
 				String name = o.get("name").getAsString();
 				String ip = o.get("ip").getAsString();
 				String[] c = o.get("coords").getAsString().split(",");
+				String rawMessage = o.has("message") ? o.get("message").getAsString() : "";
 
 				String mine = currentServer(mc);
-				if (mine == null || !mine.equalsIgnoreCase(ip)) return;            // wrong server
+				if (mine == null || !mine.equalsIgnoreCase(ip)) return;
 				if (mc.player == null || name.equals(mc.player.getGameProfile().name())) return;
 
 				int x = Integer.parseInt(c[0].trim());
 				int y = Integer.parseInt(c[1].trim());
 				int z = Integer.parseInt(c[2].trim());
+				String coordsStr = x + ", " + y + ", " + z;
 
-				boolean loaded = isLoaded(mc, name);
-				boolean beam = FORCE_BEAM || loaded || !hasWaypointMod();
+				// Process placeholders {name} and {coords} on receive as well
+				String processedMessage = rawMessage
+						.replace("{name}", name)
+						.replace("{coords}", coordsStr);
 
 				active.removeIf(s -> s.name.equals(name));
-				active.add(new Sos(name, x, y, z, beam, System.currentTimeMillis() + SOS_LIFETIME_MS));
+				active.add(new Sos(name, x, y, z, processedMessage, System.currentTimeMillis() + sosLifetimeMs));
 
-				showTitle(mc, name, x, y, z);
+				if (mc.level != null && mc.player != null) {
+					mc.level.playSound(
+							mc.player,
+							mc.player.blockPosition(),
+							SoundEvents.RAID_HORN.value(),
+							SoundSource.PLAYERS,
+							1.0f,
+							1.0f
+					);
+				}
+
+				showTitle(mc, name, x, y, z, processedMessage);
 				mc.player.displayClientMessage(
-						Component.literal("§c[SOS] §f" + name + " is low! " + x + " " + y + " " + z), false);
-
-				if (!loaded && hasXaero()) addXaeroWaypoint(mc, name, x, y, z);
+						Component.literal("§c[SOS] " + processedMessage + " §7(" + coordsStr + ")"), false);
 			} catch (Exception e) {
 				LOG.warn("bad packet: {}", json, e);
 			}
 		});
-	}
-
-	static boolean isLoaded(Minecraft mc, String name) {
-		if (mc.level == null) return false;
-		for (Player p : mc.level.players())
-			if (p.getGameProfile().name().equals(name)) return true;
-		return false;
 	}
 
 	static String currentServer(Minecraft mc) {
@@ -194,18 +220,6 @@ public class LifeLineMod implements ClientModInitializer {
 		return e == null ? null : e.ip;
 	}
 
-	static void addXaeroWaypoint(Minecraft mc, String name, int x, int y, int z) {
-		String dimKey = mc.level.dimension().toString();
-		String dim = dimKey.contains("the_nether") ? "the_nether"
-				: dimKey.contains("the_end") ? "the_end" : "overworld";
-		String set = "Internal-" + dim + "-waypoints";
-		String initial = name.substring(0, 1).toUpperCase();
-		String share = "xaero-waypoint:SOS " + name + ":" + initial + ":" + x + ":" + y + ":" + z
-				+ ":4:false:0:" + set;
-		mc.player.displayClientMessage(Component.literal(share), false);
-	}
-
-	// ---------- websocket with auto-reconnect ----------
 	static void connect() {
 		HttpClient.newHttpClient().newWebSocketBuilder()
 				.buildAsync(URI.create(WS_URL), new WebSocket.Listener() {
