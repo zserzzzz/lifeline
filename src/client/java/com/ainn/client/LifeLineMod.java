@@ -116,7 +116,7 @@ public class LifeLineMod implements ClientModInitializer {
 			active.removeIf(s -> s.expires < System.currentTimeMillis());
 		});
 
-		// HUD: Compact list overlay
+// HUD: Compact list overlay (Top-Middle aligned)
 		HudElementRegistry.attachElementAfter(
 				VanillaHudElements.CHAT,
 				Identifier.fromNamespaceAndPath("lifelinemod", "sos_hud"),
@@ -124,12 +124,19 @@ public class LifeLineMod implements ClientModInitializer {
 					if (!enabled) return;
 					Minecraft mc = Minecraft.getInstance();
 					if (mc.player == null) return;
-					int y = 4;
+
+					int screenWidth = graphics.guiWidth();
+					int y = 4; // Vertical padding from the top edge
+
 					for (Sos s : active) {
 						String displayMsg = s.message != null && !s.message.isEmpty() ? " - " + s.message : "";
-						graphics.drawString(mc.font,
-								"§c[SOS] §f" + s.name + displayMsg + " §7@ " + s.x + " " + s.y + " " + s.z,
-								4, y, 0xFFFFFFFF);
+						String fullText = "§c[SOS] §f" + s.name + displayMsg + " §7@ " + s.x + " " + s.y + " " + s.z;
+
+						// Calculate exact center position based on screen width and text length
+						int textWidth = mc.font.width(fullText);
+						int x = (screenWidth - textWidth) / 2;
+
+						graphics.drawString(mc.font, fullText, x, y, 0xFFFFFFFF);
 						y += 10;
 					}
 				});
@@ -165,6 +172,8 @@ public class LifeLineMod implements ClientModInitializer {
 		socket.sendText(o.toString(), true);
 		lastSent = System.currentTimeMillis();
 		LOG.info("SOS sent: {}", o);
+		mc.player.displayClientMessage(
+				Component.literal("§c[SOS] " + "SOS sent! allies coming soon!"), false);
 	}
 
 	static void onPacket(String json) {
